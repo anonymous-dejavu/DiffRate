@@ -36,7 +36,9 @@ def train_one_epoch(model: torch.nn.Module, criterion,
     else:
         lamb = 5
 
-    for data_iter_step, (samples, targets) in enumerate(metric_logger.log_every(data_loader, logger.info_freq, header,logger)):
+    for data_iter_step, items in enumerate(metric_logger.log_every(data_loader, logger.info_freq, header,logger)):
+        frame_idxs, samples, targets = items
+
         samples = samples.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
 
@@ -86,7 +88,8 @@ def train_one_epoch(model: torch.nn.Module, criterion,
 
 @torch.no_grad()
 def evaluate(data_loader, model, device,logger=None):
-    criterion = torch.nn.CrossEntropyLoss()
+    cosine_similarity = torch.nn.CosineSimilarity(dim=-1, eps=1e-6)
+    criterion = lambda x, y: (1 - cosine_similarity(x, y)).mean()
 
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Test:'
@@ -94,7 +97,9 @@ def evaluate(data_loader, model, device,logger=None):
     # switch to evaluation mode
     model.eval()
     
-    for images, target in metric_logger.log_every(data_loader, 10, header,logger):
+    for items in metric_logger.log_every(data_loader, 10, header,logger):
+        frame_idxs, images, target = items
+
         images = images.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
 
@@ -103,14 +108,13 @@ def evaluate(data_loader, model, device,logger=None):
             output, flops = model(images)
             loss = criterion(output, target)
 
-        acc1, acc5 = accuracy(output, target, topk=(1, 5))
         torch.cuda.synchronize()
 
         batch_size = images.shape[0]
         metric_logger.update(flops=flops/1e9)
         metric_logger.update(loss=loss.item())
-        metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
-        metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
+        # metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
+        # metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
     if hasattr(model, 'module'):  # for DDP 
         prune_kept_num, merge_kept_num = model.module.get_kept_num()
     else:
@@ -120,7 +124,7 @@ def evaluate(data_loader, model, device,logger=None):
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
 
-    logger.info('* Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f} flops {flops.global_avg:.3f}'
-          .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss, flops=metric_logger.flops))
+    logger.info('* loss {losses.global_avg:.3f} flops {flops.global_avg:.3f}'
+          .format(losses=metric_logger.loss, flops=metric_logger.flops))
 
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}

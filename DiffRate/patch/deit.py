@@ -36,13 +36,13 @@ class DiffRateBlock(Block):
         self.merge_ddp = DiffRate(patch_number,merge_granularity)
         
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, return_tokens=False, lsh_table=None) -> torch.Tensor:
         B, N, C = x.shape
         # Note: this is copied from timm.models.vision_transformer.Block with modifications.
         size = self._diffrate_info["size"]
         mask = self._diffrate_info["mask"]
         x_attn, attn = self.attn(self.norm1(x), size, mask=self._diffrate_info["mask"])
-        x = x + self.drop_path(x_attn)
+        x = x + self.drop_path1(x_attn)
 
         # importance metric
         cls_attn = attn[:, :, 0, 1:]
@@ -88,7 +88,7 @@ class DiffRateBlock(Block):
                 mask = mask * merge_mask
 
             self._diffrate_info["mask"] = mask
-            x = x + self.drop_path(self.mlp(self.norm2(x)))
+            ret = x + self.drop_path2(self.mlp(self.norm2(x)))
             
         else:
             # pruning
@@ -110,8 +110,25 @@ class DiffRateBlock(Block):
                 if self._diffrate_info["trace_source"]:
                     self._diffrate_info["source"] = merge(self._diffrate_info["source"], mode="amax")
 
-            x = x + self.drop_path(self.mlp(self.norm2(x)))
-        return x
+            ret = x + self.drop_path2(self.mlp(self.norm2(x)))
+
+            # Reusing
+            if lsh_table is not None:
+                for i in range(B):
+                    tok = x[i].squeeze()
+                    for j, t in enumerate(tok):
+                        if j == 0:
+                            continue
+                        val = lsh_table.query(t)
+                        if val:
+                            ret[i, j] = val[1]
+                        else:
+                            lsh_table.add(t, ret[i, j])
+
+        if return_tokens:
+            return ret, x
+
+        return ret
                 
 
                 

@@ -16,18 +16,16 @@ import torch.distributed as dist
 
 from pathlib import Path
 
+import sys
 import logging
 from termcolor import colored
-import sys
-
-from torch._six import inf
-import numpy as np
 import math
 import multiprocessing
 
 import socket 
 import random
 
+from torch._six import inf
 
 def dist_init(port=2333):
     if multiprocessing.get_start_method(allow_none=True) != 'spawn':

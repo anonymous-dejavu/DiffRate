@@ -18,7 +18,7 @@ from timm.scheduler import create_scheduler
 from timm.optim import create_optimizer
 from timm.utils import NativeScaler, get_state_dict, ModelEma
 
-from datasets import build_dataset
+from dataset import build_dataset
 from engine import train_one_epoch, evaluate
 from samplers import RASampler
 import utils
@@ -41,7 +41,7 @@ def get_args_parser():
     parser.add_argument('--epochs', default=300, type=int)
 
     # Model parameters
-    parser.add_argument('--model', default='deit_base_patch16_224', type=str, metavar='MODEL',
+    parser.add_argument('--model', default='vit_base_patch16_clip_224.openai', type=str, metavar='MODEL',
                         help='Name of model to train')
     parser.add_argument('--multi-reso', default=False, action='store_true',help='')
     parser.add_argument('--input-size', default=224, type=int, help='images input size')
@@ -145,8 +145,13 @@ def get_args_parser():
     # Dataset parameters
     parser.add_argument('--data-path', default='/datasets01/imagenet_full_size/061417/', type=str,
                         help='dataset path')
-    parser.add_argument('--data-set', default='IMNET', choices=['CIFAR', 'IMNET', 'INAT', 'INAT19'],
-                        type=str, help='Image Net dataset path')
+    parser.add_argument(
+        '--data-set',
+        default='IMNET',
+        choices=['CIFAR', 'IMNET', 'INAT', 'INAT19', 'CHARADES', 'HOW2QA', 'KINETICS', 'HMDB51', 'MSRVTT', 'VIDEOINSTRUCT'],
+        type=str,
+        help='Image Net dataset path'
+    )
     parser.add_argument('--inat-category', default='name',
                         choices=['kingdom', 'phylum', 'class', 'order', 'supercategory', 'family', 'genus', 'name'],
                         type=str, help='semantic granularity')
@@ -180,6 +185,9 @@ def get_args_parser():
     parser.add_argument('--granularity', type=int, default=4, help='the token number gap between each compression rate candidate')
     parser.add_argument('--load_compression_rate', action='store_true', help='eval by exiting compression rate in compression_rate.json')
     parser.add_argument('--warmup_compression_rate', action='store_true', default=False, help='inactive computational constraint in first epoch')
+    parser.add_argument('--alpha', type=int, default=5_000, help='parameter to weight cosine similarity loss')
+    parser.add_argument('--train-sampling-rate', type=float, default=0.1, help='sampling rate for training data')
+    parser.add_argument('--test-sampling-rate', type=float, default=0.1, help='sampling rate for testing data')
     return parser
 
 
@@ -204,6 +212,10 @@ def main(args):
     dataset_train, args.nb_classes = build_dataset(is_train=True, args=args)
     dataset_val, _ = build_dataset(is_train=False, args=args)
 
+    # Do uniform sampling
+    indices = list(range(0, len(dataset_train), int(1/args.train_sampling_rate)))
+    dataset_train = torch.utils.data.Subset(dataset_train, indices=indices)
+
     if True:  # args.distributed:
         num_tasks = utils.get_world_size()
         global_rank = utils.get_rank()
@@ -215,6 +227,7 @@ def main(args):
             sampler_train = torch.utils.data.DistributedSampler(
                 dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
             )
+
         if args.dist_eval:
             if len(dataset_val) % num_tasks != 0:
                 logger.info('Warning: Enabling distributed evaluation with an eval dataset not divisible by process number. '
@@ -228,6 +241,9 @@ def main(args):
         sampler_train = torch.utils.data.RandomSampler(dataset_train)
         sampler_val = torch.utils.data.SequentialSampler(dataset_val)
 
+    num_samples = int(args.test_sampling_rate * len(dataset_val))
+    sampler_val = torch.utils.data.RandomSampler(dataset_val, replacement=True, num_samples=num_samples)
+
     # leveraging MultiEpochsDataLoader for faster data loading
     data_loader_train = MultiEpochsDataLoader(
         dataset_train, sampler=sampler_train,
@@ -235,7 +251,7 @@ def main(args):
         num_workers=args.num_workers,
         pin_memory=args.pin_mem,
         drop_last=True,
-        
+
     )
 
     data_loader_val = MultiEpochsDataLoader(
@@ -248,14 +264,26 @@ def main(args):
 
     mixup_fn = None
     mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
+    # FIXME: Figure out what this is doing
+    if 'clip' in args.model:
+        mixup_active = False
     if mixup_active:
         mixup_fn = Mixup(
             mixup_alpha=args.mixup, cutmix_alpha=args.cutmix, cutmix_minmax=args.cutmix_minmax,
             prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
             label_smoothing=args.smoothing, num_classes=args.nb_classes)
-    
-    
+
+
     logger.info(f"Creating model: {args.model}")
+    if args.model.endswith('.openai'):
+        class QuickGELU(torch.nn.Module):
+            def forward(self, x: torch.Tensor):
+                return x * torch.sigmoid(1.702 * x)
+        kwargs = {'act_layer': QuickGELU}
+    else:
+        kwargs = {}
+
+
     model = create_model(
         args.model,
         pretrained=True,
@@ -263,8 +291,96 @@ def main(args):
         drop_rate=args.drop,
         drop_path_rate=args.drop_path,
         drop_block_rate=None,
+        **kwargs
     )
+
+    if args.data_set =="MSRVTT": 
+        def _convert_openai_clip(state_dict, model, prefix='vision_model.'):
+            out_dict = {}
+            swaps = [
+                ('embeddings.patch_embedding', 'patch_embed.proj'),
+                ('embeddings.position_embedding.weight', 'pos_embed'),
+                ('embeddings.class_embedding', 'cls_token'),
+                ('self_attn', 'attn'),
+                ('encoder.layers.', 'blocks.'),
+                ('pre_layrnorm', 'norm_pre'),
+                ('post_layernorm', 'norm'),
+                # ('ln_', 'norm'),
+                ('layer_norm1', 'norm1'),
+                ('layer_norm2', 'norm2'),
+                # ('in_proj_', 'qkv.'),
+                ('out_proj', 'proj'),
+                ('visual_projection', 'head'),
+                # ('mlp.c_fc', 'mlp.fc1'),
+                # ('mlp.c_proj', 'mlp.fc2'),
+            ]
+            k_proj_weights = []
+            k_proj_biases = []
+            v_proj_weights = []
+            v_proj_biases = []
+            q_proj_weights = []
+            q_proj_biases = []
+            
+            for k, v in state_dict.items():
+                if not k.startswith(prefix) and not "visual_projection" in k:
+                    continue
+                k = k.replace(prefix, '')
+                for sp in swaps:
+                    k = k.replace(sp[0], sp[1])
+                
+                if k == "head.weight":
+                    out_dict['head.bias'] = torch.zeros(v.shape[0])
+                elif k == 'cls_token':
+                    v = v.unsqueeze(0).unsqueeze(1)
+                elif k == 'pos_embed':
+                    v = v.unsqueeze(0)
+                    if v.shape[1] != model.pos_embed.shape[1]:
+                        # To resize pos embedding when using model at different size from pretrained weights
+                        v = resize_pos_embed(
+                            v,
+                            model.pos_embed,
+                            0 if getattr(model, 'no_embed_class') else getattr(model, 'num_prefix_tokens', 1),
+                            model.patch_embed.grid_size
+                        )
+                elif "attn" in k:
+                    if "k_proj.weight" in k: 
+                        k_proj_weights.append((k, v))
+                    elif "k_proj.bias" in k:
+                        k_proj_biases.append((k, v))
+                    elif "q_proj.weight" in k:
+                        q_proj_weights.append((k, v))
+                    elif "q_proj.bias" in k:
+                        q_proj_biases.append((k, v))
+                    elif "v_proj.weight" in k:
+                        v_proj_weights.append((k, v))
+                    elif "v_proj.bias" in k:
+                        v_proj_biases.append((k, v))
+                out_dict[k] = v
+            
+            for layeridx in range(len(q_proj_weights)):
+                q_w = q_proj_weights[layeridx][1]
+                q_b = q_proj_biases[layeridx][1]
+                k_w = k_proj_weights[layeridx][1]
+                k_b = k_proj_biases[layeridx][1]
+                v_w = v_proj_weights[layeridx][1]
+                v_b = v_proj_biases[layeridx][1]
+
+                weight_name = f"blocks.{layeridx}.attn.qkv.weight"
+                weight_value = torch.cat((q_w, k_w, v_w), dim=0)
+                bias_name = f"blocks.{layeridx}.attn.qkv.bias"
+                bias_value = torch.cat((q_b, k_b, v_b), dim=0)
+                out_dict[weight_name] = weight_value
+                out_dict[bias_name] = bias_value
+            
+            return out_dict
     
+        clip4clip_checkpoint = torch.load('/mnt/ssd3/CLIP4Clip/ckpts/ckpt_msrvtt_retrieval_looseType/best_hf_model/pytorch_model.bin')
+        
+        # converted_dict = clip4clip_checkpoint
+        converted_dict = _convert_openai_clip(clip4clip_checkpoint, model)
+        ret = model.load_state_dict(converted_dict, strict=False)
+    
+        assert len(ret.missing_keys) == 0
     
     # DiffRate Patch
     if 'deit' in args.model:
@@ -273,9 +389,11 @@ def main(args):
         DiffRate.patch.mae(model, prune_granularity=args.granularity, merge_granularity=args.granularity)
     elif 'caformer' in args.model:
         DiffRate.patch.caformer(model, prune_granularity=args.granularity, merge_granularity=args.granularity)
+    elif 'clip' in args.model:
+        DiffRate.patch.clip(model, prune_granularity=args.granularity, merge_granularity=args.granularity)
     else:
-        raise ValueError("only support deit, mae and caformer in this codebase")
-    
+        raise ValueError("only support deit, mae, caformer and clip in this codebase")
+
     model_name_dict = {
         'vit_deit_tiny_patch16_224':'ViT-T-DeiT',
         'vit_deit_small_patch16_224':'ViT-S-DeiT',
@@ -287,17 +405,17 @@ def main(args):
     }
     if args.load_compression_rate:
         with open('compression_rate.json', 'r') as f:
-            compression_rate = json.load(f) 
+            compression_rate = json.load(f)
             model_name = model_name_dict[args.model]
             if not str(args.target_flops) in compression_rate[model_name]:
                 raise ValueError(f"compression_rate.json does not contaion {model_name} with {args.target_flops}G flops")
             prune_kept_num = eval(compression_rate[model_name][str(args.target_flops)]['prune_kept_num'])
             merge_kept_num = eval(compression_rate[model_name][str(args.target_flops)]['merge_kept_num'])
             model.set_kept_num(prune_kept_num, merge_kept_num)
-            
-            
-        
-    
+
+
+
+
 
     if args.finetune:
         if args.finetune.startswith('https'):
@@ -349,19 +467,24 @@ def main(args):
 
     if args.eval:
         test_stats = evaluate(data_loader_val, model, device,logger)
-        logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
+        logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['loss']:.1f}%")
         return
-    
 
-    optimizer = torch.optim.AdamW(model_without_ddp.arch_parameters(), lr=args.arch_lr,weight_decay=0)
+
+    optimizer = torch.optim.AdamW(model_without_ddp.arch_parameters(), lr=args.arch_lr, weight_decay=0)
     loss_scaler = utils.NativeScalerWithGradNormCount()
-    lr_scheduler = CosineLRScheduler(optimizer, t_initial=args.epochs, lr_min=args.arch_min_lr, decay_rate=args.decay_rate )
+    lr_scheduler = CosineLRScheduler(optimizer, t_initial=args.epochs, lr_min=args.arch_min_lr, cycle_decay=args.decay_rate)
 
 
 
-    criterion = LabelSmoothingCrossEntropy()
-
-    if mixup_active:
+    if 'clip' in args.model:
+        cosine_similarity = torch.nn.CosineSimilarity(dim=-1, eps=1e-6)
+        alpha = args.alpha
+        criterion = lambda x, y: (1 - cosine_similarity(x, y).mean()) * alpha
+        # mse_loss = torch.nn.MSELoss()
+        # alpha = args.alpha
+        # criterion = lambda x, y: mse_loss(x, y) * alpha
+    elif mixup_active:
         # smoothing is handled with mixup label transform
         criterion = SoftTargetCrossEntropy()
     elif args.smoothing:
@@ -369,7 +492,7 @@ def main(args):
     else:
         criterion = torch.nn.CrossEntropyLoss()
 
-    
+
     if args.autoresume and os.path.exists(os.path.join(args.output_dir, 'checkpoint.pth')):
         args.resume = os.path.join(args.output_dir, 'checkpoint.pth')
     if args.resume:
@@ -389,7 +512,7 @@ def main(args):
 
     logger.info(f"Start training for {args.epochs} epochs")
     start_time = time.time()
-    max_accuracy = 0.0
+    min_loss = float('inf')
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
@@ -399,7 +522,7 @@ def main(args):
             optimizer,device, epoch, loss_scaler,
             args.clip_grad, mixup_fn,
             set_training_mode=args.finetune == '',  # keep in eval mode during finetuning
-            logger=logger, 
+            logger=logger,
             target_flops=args.target_flops,
             warm_up=args.warmup_compression_rate
         )
@@ -418,11 +541,11 @@ def main(args):
                 }, checkpoint_path)
 
         test_stats = evaluate(data_loader_val, model, device,logger=logger)
-        logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
-        if utils.is_main_process() and max_accuracy < test_stats['acc1'] :
+        logger.info(f"Loss of the network on the {len(dataset_val)} test images: {test_stats['loss']:.2f}")
+        if utils.is_main_process() and min_loss > test_stats['loss'] :
             shutil.copyfile(checkpoint_path, f'{args.output_dir}/model_best.pth')
-        max_accuracy = max(max_accuracy, test_stats["acc1"])
-        logger.info(f'Max accuracy: {max_accuracy:.2f}%')
+        min_loss = min(min_loss, test_stats["loss"])
+        logger.info(f'Min loss: {min_loss:.2f}%')
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                      **{f'test_{k}': v for k, v in test_stats.items()},
@@ -439,7 +562,7 @@ def main(args):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser('DeiT training and evaluation script', parents=[get_args_parser()])
+    parser = argparse.ArgumentParser('CLIP training and evaluation script', parents=[get_args_parser()])
     args = parser.parse_args()
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)

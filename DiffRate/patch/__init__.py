@@ -8,5 +8,6 @@
 from .deit import apply_patch as deit
 from .mae import apply_patch as mae
 from .caformer import apply_patch as caformer
+from .clip import apply_patch as clip
 
-__all__ = ["deit", "mae", "caformer"]
+__all__ = ["deit", "mae", "caformer", "clip"]

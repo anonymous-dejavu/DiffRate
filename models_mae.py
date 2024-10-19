@@ -16,7 +16,8 @@ import torch.nn as nn
 
 import timm.models.vision_transformer
 from timm.models.registry import register_model
-from timm.models.helpers import load_state_dict_from_url
+from torch.hub import load_state_dict_from_url
+# from timm.models.helpers import load_state_dict_from_url
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 
 
